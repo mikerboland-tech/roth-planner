@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Roth Conversion Planner · 2026 · Alabama</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <style>
+    body { margin: 0; padding: 0; background: #f7f3ec; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+const { useState, useMemo, useEffect } = React;
+// ─── 2026 Tax Constants ───────────────────────────────────────────────────────
+const STANDARD_DEDUCTION_SINGLE = 16100; // 2026 IRS Rev. Proc. 2025-32
+const OVER_65_EXTRA = 2050; // 2026 existing additional std deduction for 65+
+const OBBB_SENIOR_MAX = 6000; // OBBB new senior deduction (2025–2028)
+const OBBB_PHASEOUT_START = 75000; // Phases out above $75k MAGI (single)
+const OBBB_PHASEOUT_RATE = 0.06; // 6% reduction per dollar over threshold
+function calcOBBBDeduction(magi) {
+    if (magi <= OBBB_PHASEOUT_START)
+        return OBBB_SENIOR_MAX;
+    const reduction = (magi - OBBB_PHASEOUT_START) * OBBB_PHASEOUT_RATE;
+    return Math.max(0, OBBB_SENIOR_MAX - reduction);
+}
+// 2026 Single filer brackets — IRS Rev. Proc. 2025-32 (official)
+// OBBB applied extra 4% inflation adjustment to 10% and 12% brackets
+const BRACKETS = [
+    { rate: 0.10, floor: 0, ceiling: 12400 },
+    { rate: 0.12, floor: 12400, ceiling: 50400 },
+    { rate: 0.22, floor: 50400, ceiling: 105700 },
+    { rate: 0.24, floor: 105700, ceiling: 201775 },
+    { rate: 0.32, floor: 201775, ceiling: 256225 },
+    { rate: 0.35, floor: 256225, ceiling: 640600 },
+    { rate: 0.37, floor: 640600, ceiling: Infinity },
+];
+const BRACKET_CEILINGS = { 12: 50400, 22: 105700 };
+// IRS Uniform Lifetime Table (Pub. 590-B) — distribution periods by age
+const ULT = {
+    72: 27.4, 73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1,
+    80: 20.2, 81: 19.4, 82: 18.5, 83: 17.7, 84: 16.8, 85: 16.0, 86: 15.2, 87: 14.4,
+    88: 13.7, 89: 12.9, 90: 12.2, 91: 11.5, 92: 10.8, 93: 10.1, 94: 9.5, 95: 8.9,
+    96: 8.4, 97: 7.8, 98: 7.3, 99: 6.8, 100: 6.4, 101: 6.0, 102: 5.6, 103: 5.2,
+    104: 4.9, 105: 4.6, 106: 4.3, 107: 4.1, 108: 3.9, 109: 3.7, 110: 3.5, 111: 3.4,
+    112: 3.3, 113: 3.1, 114: 3.0, 115: 2.9, 116: 2.8, 117: 2.7, 118: 2.5, 119: 2.3, 120: 2.0
+};
+function calcRMD(accountValue, age) {
+    var _a;
+    const av = parseFloat(String(accountValue).replace(/[^0-9.]/g, ""));
+    const a = parseInt(age);
+    if (!av || !a || a < 72)
+        return 0;
+    const divisor = (_a = ULT[Math.min(a, 120)]) !== null && _a !== void 0 ? _a : 2.0;
+    return av / divisor;
+}
+// Social Security provisional income thresholds (single)
+const SS_THRESH_50 = 25000;
+const SS_THRESH_85 = 34000;
+function fmt(n) {
+    if (n === null || n === undefined || isNaN(n))
+        return "$—";
+    return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n);
+}
+function parseDollar(s) {
+    const n = parseFloat(s.replace(/[^0-9.]/g, ""));
+    return isNaN(n) ? 0 : n;
+}
+function calcTax(taxableIncome) {
+    if (taxableIncome <= 0)
+        return 0;
+    let tax = 0;
+    for (const b of BRACKETS) {
+        if (taxableIncome <= b.floor)
+            break;
+        const amount = Math.min(taxableIncome, b.ceiling) - b.floor;
+        tax += amount * b.rate;
+    }
+    return tax;
+}
+// ─── Alabama Tax Constants ────────────────────────────────────────────────────
+// Source: Alabama DOR, Form 40 (rates unchanged for 2026)
+const AL_BRACKETS = [
+    { rate: 0.02, floor: 0, ceiling: 500 },
+    { rate: 0.04, floor: 500, ceiling: 3000 },
+    { rate: 0.05, floor: 3000, ceiling: Infinity },
+];
+const AL_PERSONAL_EXEMPTION = 1500; // Single filer
+const AL_RETIREMENT_EXCLUSION = 6000; // Age 65+ exclusion on IRA/RMD income
+// Alabama standard deduction (single): $4,500 max, phases down by income
+// Per Form 40 instructions / ALDOR Standard Deduction Chart (2025/2026)
+function calcALStandardDeduction(alAGI) {
+    if (alAGI <= 20000)
+        return 4500;
+    if (alAGI <= 30499)
+        return 3500;
+    if (alAGI <= 50999)
+        return 2500;
+    return 2000; // $51,000+
+}
+// Alabama income tax calculation for single filer, age 65+, NASA pension
+// Key exemptions: SS fully exempt, government DB pension exempt, age-65 $6k retirement exclusion
+// Key deduction: federal income taxes paid (deductible in Alabama — unique provision)
+function calcAlabamaTax({ pensionAmt, divAmt, cgAmt, intAmt, taxableRMD, rothAmt, federalTaxPaid }) {
+    // SS is fully exempt in Alabama — not included
+    // NASA pension (defined benefit government plan) is fully exempt in Alabama
+    // IRA/RMD distributions: taxable, but age 65+ may exclude up to $6,000
+    const rmdAfterExclusion = Math.max(0, taxableRMD - AL_RETIREMENT_EXCLUSION);
+    // Alabama AGI (no SS, no pension, RMD with exclusion applied)
+    const alAGI = divAmt + cgAmt + intAmt + rmdAfterExclusion + rothAmt;
+    // Deductions: standard deduction + personal exemption + federal taxes paid
+    const stdDed = calcALStandardDeduction(alAGI);
+    const totalDed = stdDed + AL_PERSONAL_EXEMPTION + federalTaxPaid;
+    // Alabama taxable income
+    const alTaxableIncome = Math.max(0, alAGI - totalDed);
+    // Apply Alabama brackets
+    let tax = 0;
+    for (const b of AL_BRACKETS) {
+        if (alTaxableIncome <= b.floor)
+            break;
+        const amount = Math.min(alTaxableIncome, b.ceiling) - b.floor;
+        tax += amount * b.rate;
+    }
+    return { alAGI, rmdAfterExclusion, stdDed, alTaxableIncome, alTax: tax };
+}
+// Determine taxable SS based on provisional income
+function taxableSS(ssGross, provisionalIncome) {
+    if (provisionalIncome <= SS_THRESH_50)
+        return 0;
+    if (provisionalIncome <= SS_THRESH_85) {
+        return Math.min(ssGross * 0.50, (provisionalIncome - SS_THRESH_50) * 0.50);
+    }
+    const tier1 = Math.min(ssGross * 0.50, (SS_THRESH_85 - SS_THRESH_50) * 0.50);
+    const tier2 = Math.min(ssGross * 0.85 - tier1, (provisionalIncome - SS_THRESH_85) * 0.85);
+    return Math.min(ssGross * 0.85, tier1 + tier2);
+}
+// ─── InputField Component ─────────────────────────────────────────────────────
+function InputField({ label, value, onChange, hint }) {
+    return (React.createElement("div", { className: "input-group" },
+        React.createElement("label", null, label),
+        React.createElement("div", { className: "input-wrap" },
+            React.createElement("span", { className: "dollar-sign" }, "$"),
+            React.createElement("input", { type: "text", value: value, onChange: e => onChange(e.target.value), placeholder: "0" })),
+        hint && React.createElement("span", { className: "hint" }, hint)));
+}
+// ─── Main App ─────────────────────────────────────────────────────────────────
+function RothPlanner() {
+    var _a;
+    const [ss, setSS] = useState("");
+    const [pension, setPension] = useState("");
+    const [dividends, setDiv] = useState("");
+    const [capGains, setCG] = useState("");
+    const [interest, setInt] = useState("");
+    const [rmds, setRMDs] = useState("");
+    const [qcds, setQCDs] = useState("");
+    const [roth, setRoth] = useState("");
+    const [targetBracket, setTargetBracket] = useState(12);
+    const [age, setAge] = useState("79");
+    const [accountValue, setAccountValue] = useState("");
+    // ── Save / Load ───────────────────────────────────────────────────────────
+    // localStorage for auto-persistence + Export/Import JSON for cross-device sharing.
+    // Matches the pattern used in the companion Retirement Planner tool.
+    const STORAGE_KEY = "roth-planner-scenarios";
+    const [savedScenarios, setSavedScenarios] = useState({});
+    const [saveName, setSaveName] = useState("");
+    const [saveMsg, setSaveMsg] = useState(null);
+    const [loadOpen, setLoadOpen] = useState(false);
+    const [showClearConfirm, setShowClearConfirm] = useState(false);
+    // localStorage helpers — simple, synchronous, universally supported
+    const lsGet = (key) => {
+        try {
+            return localStorage.getItem(key);
+        }
+        catch (_) {
+            return null;
+        }
+    };
+    const lsSet = (key, value) => {
+        try {
+            localStorage.setItem(key, value);
+            return true;
+        }
+        catch (_) {
+            return false;
+        }
+    };
+    const lsDel = (key) => {
+        try {
+            localStorage.removeItem(key);
+        }
+        catch (_) { }
+    };
+    // Load saved scenarios on mount
+    useEffect(() => {
+        const raw = lsGet(STORAGE_KEY);
+        if (raw) {
+            try {
+                setSavedScenarios(JSON.parse(raw));
+            }
+            catch (_) { }
+        }
+    }, []);
+    const flashMsg = (text, type = "ok") => {
+        setSaveMsg({ text, type });
+        setTimeout(() => setSaveMsg(null), 2800);
+    };
+    const currentValues = () => ({ ss, pension, dividends, capGains, interest, rmds, qcds, roth, targetBracket, age, accountValue });
+    const handleSave = () => {
+        const name = saveName.trim();
+        if (!name) {
+            flashMsg("Enter a scenario name first.", "err");
+            return;
+        }
+        const updated = Object.assign(Object.assign({}, savedScenarios), { [name]: currentValues() });
+        lsSet(STORAGE_KEY, JSON.stringify(updated));
+        setSavedScenarios(updated);
+        flashMsg(`"${name}" saved ✓`);
+    };
+    const handleLoad = (name) => {
+        var _a, _b, _c, _d, _e, _f, _g, _h;
+        const s = savedScenarios[name];
+        if (!s)
+            return;
+        setSS((_a = s.ss) !== null && _a !== void 0 ? _a : "");
+        setPension((_b = s.pension) !== null && _b !== void 0 ? _b : "");
+        setDiv((_c = s.dividends) !== null && _c !== void 0 ? _c : "");
+        setCG((_d = s.capGains) !== null && _d !== void 0 ? _d : "");
+        setInt((_e = s.interest) !== null && _e !== void 0 ? _e : "");
+        setRMDs((_f = s.rmds) !== null && _f !== void 0 ? _f : "");
+        setQCDs((_g = s.qcds) !== null && _g !== void 0 ? _g : "");
+        setRoth((_h = s.roth) !== null && _h !== void 0 ? _h : "");
+        if (s.targetBracket)
+            setTargetBracket(s.targetBracket);
+        if (s.age)
+            setAge(s.age);
+        if (s.accountValue !== undefined)
+            setAccountValue(s.accountValue);
+        setLoadOpen(false);
+        setSaveName(name);
+        flashMsg(`"${name}" loaded ✓`);
+    };
+    const handleDelete = (name, e) => {
+        e.stopPropagation();
+        const updated = Object.assign({}, savedScenarios);
+        delete updated[name];
+        lsSet(STORAGE_KEY, JSON.stringify(updated));
+        setSavedScenarios(updated);
+    };
+    const handleClear = () => {
+        setSS("");
+        setPension("");
+        setDiv("");
+        setCG("");
+        setInt("");
+        setRMDs("");
+        setQCDs("");
+        setRoth("");
+        setTargetBracket(12);
+        setAge("");
+        setAccountValue("");
+        setShowClearConfirm(false);
+        flashMsg("Inputs cleared.");
+    };
+    // ── Export all saved scenarios ─────────────────────────────────────────────
+    // On iOS: uses the native Share Sheet (save to Files, Mail, Notes, AirDrop, etc.)
+    // On desktop: triggers a direct file download
+    const handleExport = async () => {
+        if (Object.keys(savedScenarios).length === 0) {
+            flashMsg("No saved scenarios to export.", "err");
+            return;
+        }
+        const date = new Date().toISOString().slice(0, 10);
+        const filename = `roth-planner-scenarios-${date}.json`;
+        const json = JSON.stringify(savedScenarios, null, 2);
+        const blob = new Blob([json], { type: "application/json" });
+        // Use Web Share API if available (iOS Safari, Android Chrome)
+        if (navigator.share && navigator.canShare) {
+            const file = new File([blob], filename, { type: "application/json" });
+            if (navigator.canShare({ files: [file] })) {
+                try {
+                    await navigator.share({
+                        title: "Roth Planner Scenarios",
+                        text: `Backup of ${Object.keys(savedScenarios).length} scenario(s) — ${date}`,
+                        files: [file],
+                    });
+                    flashMsg("Shared ✓");
+                    return;
+                } catch (err) {
+                    if (err.name === "AbortError") return; // user cancelled — silent
+                    // fall through to download
+                }
+            }
+        }
+        // Desktop fallback: trigger download
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+        flashMsg("Scenarios exported ✓");
+    };
+    // ── Import scenarios from a JSON file ─────────────────────────────────────
+    const handleImport = (e) => {
+        const file = e.target.files[0];
+        if (!file)
+            return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            try {
+                const imported = JSON.parse(ev.target.result);
+                const merged = Object.assign(Object.assign({}, savedScenarios), imported);
+                lsSet(STORAGE_KEY, JSON.stringify(merged));
+                setSavedScenarios(merged);
+                flashMsg(`Imported ${Object.keys(imported).length} scenario(s) ✓`);
+            }
+            catch (_) {
+                flashMsg("Import failed — invalid file.", "err");
+            }
+        };
+        reader.readAsText(file);
+        e.target.value = ""; // reset input so same file can be re-imported
+    };
+    // ── Clear ALL saved scenarios from localStorage ───────────────────────────
+    const handleClearAllScenarios = () => {
+        lsDel(STORAGE_KEY);
+        setSavedScenarios({});
+        setShowClearConfirm(false);
+        flashMsg("All saved scenarios deleted.");
+    };
+    const ageNum = parseInt(age) || 0;
+    const accountValueNum = parseDollar(accountValue);
+    const calculatedRMD = calcRMD(accountValueNum, ageNum);
+    const inputs = {
+        ss: parseDollar(ss),
+        pension: parseDollar(pension),
+        dividends: parseDollar(dividends),
+        capGains: parseDollar(capGains),
+        interest: parseDollar(interest),
+        rmds: parseDollar(rmds) || calculatedRMD,
+        qcds: parseDollar(qcds),
+        roth: parseDollar(roth),
+    };
+    const results = useMemo(() => {
+        const { ss: ssAmt, pension: pensionAmt, dividends: divAmt, capGains: cgAmt, interest: intAmt, rmds: rmdAmt, qcds: qcdAmt, roth: rothAmt } = inputs;
+        // QCDs reduce taxable RMDs (up to RMD amount, max $105k in 2026)
+        const qcdApplied = Math.min(qcdAmt, rmdAmt, 105000);
+        const taxableRMD = rmdAmt - qcdApplied;
+        const provisionalIncome = pensionAmt + divAmt + cgAmt + intAmt + taxableRMD + rothAmt + ssAmt * 0.5;
+        const taxSSAmt = taxableSS(ssAmt, provisionalIncome);
+        // AGI
+        const agi = taxSSAmt + pensionAmt + divAmt + cgAmt + intAmt + taxableRMD + rothAmt;
+        // OBBB $6,000 senior deduction with phaseout based on MAGI (≈ AGI here)
+        const obbDeduction = calcOBBBDeduction(agi);
+        const totalDeduction = STANDARD_DEDUCTION_SINGLE + OVER_65_EXTRA + obbDeduction;
+        // Taxable income
+        const taxableIncome = Math.max(0, agi - totalDeduction);
+        const taxOwed = calcTax(taxableIncome);
+        const effectiveRate = agi > 0 ? taxOwed / agi : 0;
+        // Room in selected bracket
+        const bracketCeiling = BRACKET_CEILINGS[targetBracket];
+        const additionalRoom = Math.max(0, bracketCeiling - taxableIncome);
+        // Marginal bracket
+        let marginalBracket = "10%";
+        for (const b of [...BRACKETS].reverse()) {
+            if (taxableIncome > b.floor) {
+                marginalBracket = `${(b.rate * 100).toFixed(0)}%`;
+                break;
+            }
+        }
+        // ── Alabama State Tax ──────────────────────────────────────────────────
+        const alResult = calcAlabamaTax({
+            pensionAmt, divAmt, cgAmt, intAmt, taxableRMD, rothAmt,
+            federalTaxPaid: taxOwed, // AL allows deduction of federal taxes paid
+        });
+        const combinedTax = taxOwed + alResult.alTax;
+        const combinedEffRate = agi > 0 ? combinedTax / agi : 0;
+        return {
+            taxSSAmt, taxSSPct: ssAmt > 0 ? (taxSSAmt / ssAmt * 100).toFixed(0) : 0,
+            provisionalIncome,
+            taxableRMD, qcdApplied,
+            agi, taxableIncome, taxOwed, effectiveRate,
+            additionalRoom, marginalBracket, bracketCeiling,
+            obbDeduction, totalDeduction, stdDeduction: STANDARD_DEDUCTION_SINGLE, over65Extra: OVER_65_EXTRA,
+            // Alabama
+            alAGI: alResult.alAGI,
+            alStdDed: alResult.stdDed,
+            alTaxableIncome: alResult.alTaxableIncome,
+            alTax: alResult.alTax,
+            alRMDExclusion: Math.min(inputs.rmds || calculatedRMD, AL_RETIREMENT_EXCLUSION),
+            combinedTax, combinedEffRate,
+        };
+        // calculatedRMD exposed directly via outer scope
+    }, [inputs, targetBracket, ageNum]);
+    return (React.createElement(React.Fragment, null,
+        React.createElement("style", null, `
+        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Source+Sans+3:wght@300;400;500;600&display=swap');
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+          --navy:    #0d1f3c;
+          --navy2:   #162b50;
+          --gold:    #c9a84c;
+          --gold2:   #e8c96e;
+          --cream:   #f7f3ec;
+          --green:   #2a7d4f;
+          --green-l: #d4edda;
+          --red:     #8b2c2c;
+          --red-l:   #fdeaea;
+          --muted:   #6b7a8d;
+          --rule:    rgba(201,168,76,0.25);
+          --card-bg: #ffffff;
+          --shadow:  0 2px 16px rgba(13,31,60,0.10);
+        }
+
+        body { background: var(--cream); font-family: 'Source Sans 3', sans-serif; color: var(--navy); }
+
+        .app { max-width: 960px; margin: 0 auto; padding: 24px 16px 60px; }
+
+        /* Header */
+        .header { text-align: center; padding: 36px 0 28px; }
+        .header-seal {
+          width: 56px; height: 56px; border-radius: 50%;
+          background: var(--navy); border: 3px solid var(--gold);
+          display: inline-flex; align-items: center; justify-content: center;
+          font-size: 24px; margin-bottom: 14px;
+        }
+        .header h1 {
+          font-family: 'Playfair Display', serif;
+          font-size: 1.9rem; font-weight: 700;
+          color: var(--navy); letter-spacing: -0.01em;
+        }
+        .header p {
+          color: var(--muted); font-size: 0.9rem; margin-top: 6px;
+          font-weight: 300; letter-spacing: 0.03em;
+        }
+        .gold-rule { width: 60px; height: 2px; background: var(--gold); margin: 14px auto 0; border-radius: 2px; }
+
+        /* Grid layout */
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 24px; }
+        @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+
+        /* Cards */
+        .card {
+          background: var(--card-bg); border-radius: 10px;
+          box-shadow: var(--shadow); overflow: hidden;
+        }
+        .card-header {
+          background: var(--navy); padding: 14px 20px;
+          display: flex; align-items: center; gap: 10px;
+        }
+        .card-header h2 {
+          font-family: 'Playfair Display', serif;
+          font-size: 1rem; font-weight: 600; color: #fff;
+          letter-spacing: 0.01em;
+        }
+        .card-icon { font-size: 1rem; opacity: 0.8; }
+        .bracket-toggle { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+        .toggle-label { font-size: 0.72rem; color: rgba(255,255,255,0.55); text-transform: uppercase; letter-spacing: 0.07em; }
+        .toggle-btn {
+          padding: 4px 14px; border-radius: 20px; border: 1.5px solid rgba(201,168,76,0.45);
+          background: transparent; color: rgba(255,255,255,0.65); font-size: 0.82rem; font-weight: 600;
+          cursor: pointer; font-family: inherit; transition: all 0.15s;
+        }
+        .toggle-btn:hover { border-color: var(--gold2); color: #fff; }
+        .toggle-btn.active { background: var(--gold); border-color: var(--gold); color: var(--navy); }
+        .card-body { padding: 20px; }
+
+        /* Inputs */
+        .input-group { margin-bottom: 14px; }
+        .input-group:last-child { margin-bottom: 0; }
+        .input-group label {
+          display: block; font-size: 0.78rem; font-weight: 600;
+          text-transform: uppercase; letter-spacing: 0.08em;
+          color: var(--muted); margin-bottom: 5px;
+        }
+        .input-wrap { position: relative; }
+        .dollar-sign {
+          position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+          color: var(--muted); font-size: 0.9rem; font-weight: 500;
+        }
+        input {
+          width: 100%; padding: 9px 12px 9px 24px;
+          border: 1.5px solid #dde3ec; border-radius: 6px;
+          font-family: 'Source Sans 3', sans-serif; font-size: 0.95rem;
+          color: var(--navy); background: #fafbfd;
+          transition: border-color 0.15s, box-shadow 0.15s;
+          outline: none;
+        }
+        input:focus {
+          border-color: var(--gold); background: #fff;
+          box-shadow: 0 0 0 3px rgba(201,168,76,0.15);
+        }
+        .hint { display: block; font-size: 0.72rem; color: var(--muted); margin-top: 4px; font-style: italic; }
+
+        /* Results card */
+        .results-card { grid-column: 1 / -1; }
+        .results-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+        @media (max-width: 640px) { .results-grid { grid-template-columns: 1fr 1fr; } }
+
+        .stat-box {
+          background: #f4f7fb; border-radius: 8px; padding: 14px 16px;
+          border: 1px solid #e4e9f2;
+        }
+        .stat-box.highlight {
+          background: var(--navy); border-color: var(--navy2);
+        }
+        .stat-box.positive {
+          background: var(--green-l); border-color: rgba(42,125,79,0.3);
+        }
+        .stat-box.warning {
+          background: var(--red-l); border-color: rgba(139,44,44,0.3);
+        }
+        .stat-label {
+          font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em;
+          color: var(--muted); font-weight: 600; margin-bottom: 4px;
+        }
+        .stat-box.highlight .stat-label { color: rgba(255,255,255,0.6); }
+        .stat-value {
+          font-family: 'Playfair Display', serif;
+          font-size: 1.4rem; font-weight: 700; color: var(--navy);
+        }
+        .stat-box.highlight .stat-value { color: var(--gold2); }
+        .stat-box.positive .stat-value { color: var(--green); }
+        .stat-box.warning .stat-value { color: var(--red); }
+        .stat-sub { font-size: 0.75rem; color: var(--muted); margin-top: 3px; }
+        .stat-box.highlight .stat-sub { color: rgba(255,255,255,0.45); }
+
+        /* Waterfall */
+        .waterfall { margin-top: 4px; }
+        .wf-row {
+          display: flex; justify-content: space-between; align-items: center;
+          padding: 8px 0; border-bottom: 1px solid #f0f3f8; font-size: 0.88rem;
+        }
+        .wf-row:last-child { border-bottom: none; }
+        .wf-row.total {
+          font-weight: 700; padding-top: 10px; margin-top: 2px;
+          border-top: 2px solid var(--rule); border-bottom: none;
+        }
+        .wf-label { color: var(--navy); }
+        .wf-note { font-size: 0.74rem; color: var(--muted); margin-left: 6px; }
+        .wf-value { font-weight: 600; color: var(--navy); font-variant-numeric: tabular-nums; }
+        .wf-value.deduct { color: var(--green); }
+        .wf-value.zero { color: #bbb; }
+
+        /* Conversion spotlight */
+        .conversion-box {
+          background: var(--navy); border-radius: 10px;
+          padding: 24px; color: #fff; margin-top: 20px;
+          display: flex; align-items: center; gap: 24px;
+          flex-wrap: wrap;
+        }
+        .conversion-icon { font-size: 2.5rem; }
+        .conversion-main { flex: 1 1 180px; }
+        .conversion-main h3 {
+          font-family: 'Playfair Display', serif;
+          font-size: 1rem; color: rgba(255,255,255,0.7); margin-bottom: 4px;
+        }
+        .conversion-amount {
+          font-family: 'Playfair Display', serif;
+          font-size: 2.4rem; font-weight: 700; color: var(--gold2);
+          line-height: 1;
+        }
+        .conversion-sub { font-size: 0.8rem; color: rgba(255,255,255,0.5); margin-top: 6px; }
+        .conversion-details { flex: 1 1 200px; }
+        .cd-row { display: flex; justify-content: space-between; font-size: 0.84rem;
+          padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.1); }
+        .cd-row:last-child { border-bottom: none; }
+        .cd-label { color: rgba(255,255,255,0.6); }
+        .cd-value { color: #fff; font-weight: 600; }
+        .cd-value.gold { color: var(--gold2); }
+
+        /* Save / Load bar */
+        .savebar {
+          background: var(--navy2); border-radius: 8px; padding: 12px 16px;
+          display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+          margin-bottom: 4px; position: relative;
+        }
+        .savebar-label { font-size: 0.73rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255,255,255,0.5); white-space: nowrap; }
+        .savebar input {
+          flex: 1 1 140px; padding: 6px 10px; border-radius: 5px; font-size: 0.85rem;
+          border: 1.5px solid rgba(201,168,76,0.35); background: rgba(255,255,255,0.07);
+          color: #fff; font-family: inherit; outline: none; min-width: 0;
+        }
+        .savebar input::placeholder { color: rgba(255,255,255,0.3); }
+        .savebar input:focus { border-color: var(--gold); background: rgba(255,255,255,0.12); }
+        .savebar-btn {
+          padding: 6px 14px; border-radius: 5px; font-size: 0.82rem; font-weight: 600;
+          cursor: pointer; font-family: inherit; border: none; transition: all 0.15s; white-space: nowrap;
+        }
+        .savebar-btn.primary { background: var(--gold); color: var(--navy); }
+        .savebar-btn.primary:hover { background: var(--gold2); }
+        .savebar-btn.secondary { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.8); border: 1.5px solid rgba(255,255,255,0.15); }
+        .savebar-btn.secondary:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .savebar-btn.danger { background: rgba(139,44,44,0.4); color: #fca; border: 1.5px solid rgba(255,100,100,0.25); }
+        .savebar-btn.danger:hover { background: rgba(139,44,44,0.7); }
+        .save-msg {
+          font-size: 0.78rem; padding: 3px 10px; border-radius: 4px; font-weight: 500;
+          background: rgba(42,125,79,0.25); color: #7de0a8; border: 1px solid rgba(42,125,79,0.4);
+        }
+        .save-msg.err { background: rgba(139,44,44,0.3); color: #f9a; border-color: rgba(200,80,80,0.4); }
+        /* Load dropdown */
+        .load-dropdown {
+          position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 100;
+          background: #1a2d50; border: 1px solid rgba(201,168,76,0.3); border-radius: 8px;
+          box-shadow: 0 8px 28px rgba(0,0,0,0.35); overflow: hidden;
+        }
+        .load-dropdown-header { padding: 10px 16px; font-size: 0.73rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255,255,255,0.4); border-bottom: 1px solid rgba(255,255,255,0.08); }
+        .load-item {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 10px 16px; cursor: pointer; transition: background 0.1s;
+          border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+        .load-item:last-child { border-bottom: none; }
+        .load-item:hover { background: rgba(201,168,76,0.12); }
+        .load-item-name { color: #fff; font-size: 0.88rem; font-weight: 500; }
+        .load-item-del { color: rgba(255,120,120,0.7); font-size: 0.78rem; padding: 2px 8px; border-radius: 4px; border: 1px solid rgba(255,100,100,0.2); background: transparent; cursor: pointer; font-family: inherit; }
+        .load-item-del:hover { background: rgba(139,44,44,0.4); color: #fca; }
+        .load-empty { padding: 16px; text-align: center; color: rgba(255,255,255,0.35); font-size: 0.85rem; font-style: italic; }
+
+        /* Alabama State Tax Card */
+        .state-tax-card { grid-column: 1 / -1; }
+        .al-flag { font-size: 0.75rem; background: #A4343A; color: #fff; padding: 2px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 0.04em; margin-left: 8px; }
+        .al-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px; }
+        @media (max-width: 640px) { .al-grid { grid-template-columns: 1fr 1fr; } }
+        .combined-banner {
+          background: linear-gradient(135deg, var(--navy) 0%, #1a3a60 100%);
+          border-radius: 10px; padding: 20px 24px; display: flex;
+          align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;
+          border: 1px solid rgba(201,168,76,0.3);
+        }
+        .combined-item { text-align: center; }
+        .combined-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255,255,255,0.5); margin-bottom: 4px; }
+        .combined-value { font-family: 'Playfair Display', serif; font-size: 1.5rem; font-weight: 700; color: var(--gold2); }
+        .combined-value.big { font-size: 2rem; }
+        .combined-divider { width: 1px; height: 48px; background: rgba(255,255,255,0.15); }
+        .al-waterfall { margin-top: 4px; }
+
+        /* Footer note */
+        .footnote {
+          margin-top: 28px; font-size: 0.74rem; color: var(--muted);
+          text-align: center; line-height: 1.6; padding: 0 16px;
+        }
+
+        /* RMD Calculator section */
+        .rmd-section {
+          background: #f0f4fa; border-radius: 8px; padding: 14px 16px;
+          margin-bottom: 16px; border: 1px solid #dde3ec;
+        }
+        .rmd-section-title {
+          font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+          letter-spacing: 0.09em; color: var(--navy); margin-bottom: 12px;
+          opacity: 0.7;
+        }
+        .rmd-inputs-row { display: flex; gap: 12px; align-items: flex-end; }
+        .rmd-age-field { flex: 0 0 90px; }
+        .rmd-acct-field { flex: 1; }
+        .rmd-age-field label, .rmd-acct-field label {
+          display: block; font-size: 0.78rem; font-weight: 600;
+          text-transform: uppercase; letter-spacing: 0.08em;
+          color: var(--muted); margin-bottom: 5px;
+        }
+        .age-input {
+          width: 100%; padding: 9px 10px; border: 1.5px solid #dde3ec;
+          border-radius: 6px; font-family: 'Source Sans 3', sans-serif;
+          font-size: 0.95rem; color: var(--navy); background: #fafbfd;
+          outline: none; transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .age-input:focus {
+          border-color: var(--gold); background: #fff;
+          box-shadow: 0 0 0 3px rgba(201,168,76,0.15);
+        }
+        .rmd-result-row {
+          display: flex; justify-content: space-between; align-items: center;
+          margin-top: 12px; padding: 8px 12px; background: var(--navy);
+          border-radius: 6px;
+        }
+        .rmd-result-label { font-size: 0.78rem; color: rgba(255,255,255,0.65); }
+        .rmd-result-value {
+          font-family: 'Playfair Display', serif; font-size: 1.1rem;
+          font-weight: 700; color: var(--gold2);
+        }
+        .rmd-override-hint {
+          font-size: 0.71rem; color: var(--muted); margin-top: 6px;
+          font-style: italic;
+        }
+
+        /* Roth conversion row highlight */
+        .wf-row.roth-row .wf-label { color: var(--gold); font-weight: 600; }
+        .wf-row.roth-row .wf-value { color: var(--gold); }
+      `),
+        React.createElement("div", { className: "app" },
+            React.createElement("div", { className: "header" },
+                React.createElement("div", { className: "header-seal" }, "\uD83C\uDFDB\uFE0F"),
+                React.createElement("h1", null, "Roth Conversion Planner"),
+                React.createElement("p", null, "2026 Tax Year \u00B7 Single Filer \u00B7 Age 79 \u00B7 NASA Pension"),
+                React.createElement("div", { className: "gold-rule" })),
+            React.createElement("div", { className: "savebar" },
+                React.createElement("span", { className: "savebar-label" }, "Scenario:"),
+                React.createElement("input", { type: "text", placeholder: "Name this scenario\u2026", value: saveName, onChange: e => setSaveName(e.target.value), onKeyDown: e => e.key === "Enter" && handleSave() }),
+                React.createElement("button", { className: "savebar-btn primary", onClick: handleSave }, "Save"),
+                React.createElement("div", { style: { position: "relative" } },
+                    React.createElement("button", { className: "savebar-btn secondary", onClick: () => setLoadOpen(o => !o) },
+                        "Load ",
+                        Object.keys(savedScenarios).length > 0 ? `(${Object.keys(savedScenarios).length})` : ""),
+                    loadOpen && (React.createElement("div", { className: "load-dropdown" },
+                        React.createElement("div", { className: "load-dropdown-header" }, "Saved Scenarios"),
+                        Object.keys(savedScenarios).length === 0
+                            ? React.createElement("div", { className: "load-empty" }, "No saved scenarios yet")
+                            : Object.keys(savedScenarios).map(name => (React.createElement("div", { key: name, className: "load-item", onClick: () => handleLoad(name) },
+                                React.createElement("span", { className: "load-item-name" },
+                                    "\uD83D\uDCC1 ",
+                                    name),
+                                React.createElement("button", { className: "load-item-del", onClick: e => handleDelete(name, e) }, "\u2715"))))))),
+                React.createElement("button", { className: "savebar-btn secondary", onClick: handleExport, title: "Download all scenarios as a JSON backup file" }, "\u2B07 Export"),
+                React.createElement("label", { className: "savebar-btn secondary", style: { cursor: "pointer" }, title: "Import scenarios from a previously exported file" },
+                    "\u2B06 Import",
+                    React.createElement("input", { type: "file", accept: ".json", onChange: handleImport, style: { display: "none" } })),
+                React.createElement("button", { className: "savebar-btn danger", onClick: handleClear, title: "Clear current input fields" }, "Clear Inputs"),
+                !showClearConfirm
+                    ? React.createElement("button", { className: "savebar-btn danger", onClick: () => setShowClearConfirm(true), title: "Delete all saved scenarios from this browser" }, "\uD83D\uDDD1 Delete All")
+                    : React.createElement("span", { style: { display: "flex", gap: "6px", alignItems: "center" } },
+                        React.createElement("span", { style: { fontSize: "0.78rem", color: "#e07070" } }, "Delete all saved?"),
+                        React.createElement("button", { className: "savebar-btn danger", onClick: handleClearAllScenarios }, "Yes"),
+                        React.createElement("button", { className: "savebar-btn secondary", onClick: () => setShowClearConfirm(false) }, "No")),
+                saveMsg && React.createElement("span", { className: `save-msg ${saveMsg.type === "err" ? "err" : ""}` }, saveMsg.text)),
+            React.createElement("div", { className: "grid" },
+                React.createElement("div", { className: "card" },
+                    React.createElement("div", { className: "card-header" },
+                        React.createElement("span", { className: "card-icon" }, "\uD83D\uDCCB"),
+                        React.createElement("h2", null, "Income Sources")),
+                    React.createElement("div", { className: "card-body" },
+                        React.createElement(InputField, { label: "Social Security (Annual Gross)", value: ss, onChange: setSS, hint: "50\u201385% may be taxable based on provisional income" }),
+                        React.createElement(InputField, { label: "NASA Pension", value: pension, onChange: setPension, hint: "Fully taxable ordinary income" }),
+                        React.createElement(InputField, { label: "Ordinary Dividends", value: dividends, onChange: setDiv }),
+                        React.createElement(InputField, { label: "Long-Term Capital Gains", value: capGains, onChange: setCG, hint: "Preferential rate (simplified as ordinary here)" }),
+                        React.createElement(InputField, { label: "Interest Income", value: interest, onChange: setInt }))),
+                React.createElement("div", { className: "card" },
+                    React.createElement("div", { className: "card-header" },
+                        React.createElement("span", { className: "card-icon" }, "\u2696\uFE0F"),
+                        React.createElement("h2", null, "Distributions & Adjustments")),
+                    React.createElement("div", { className: "card-body" },
+                        React.createElement("div", { className: "rmd-section" },
+                            React.createElement("div", { className: "rmd-section-title" }, "RMD Calculator"),
+                            React.createElement("div", { className: "rmd-inputs-row" },
+                                React.createElement("div", { className: "rmd-age-field" },
+                                    React.createElement("label", null, "Current Age"),
+                                    React.createElement("input", { type: "number", min: "72", max: "120", value: age, onChange: e => setAge(e.target.value), placeholder: "79", className: "age-input" })),
+                                React.createElement("div", { className: "rmd-acct-field" },
+                                    React.createElement("label", null, "Total RMD-Eligible Accounts"),
+                                    React.createElement("div", { className: "input-wrap" },
+                                        React.createElement("span", { className: "dollar-sign" }, "$"),
+                                        React.createElement("input", { type: "text", value: accountValue, onChange: e => setAccountValue(e.target.value), placeholder: "0" })))),
+                            calculatedRMD > 0 && (React.createElement("div", { className: "rmd-result-row" },
+                                React.createElement("span", { className: "rmd-result-label" },
+                                    "Calculated RMD (Age ",
+                                    ageNum,
+                                    ", Divisor ", (_a = ULT[Math.min(ageNum, 120)]) !== null && _a !== void 0 ? _a : "—",
+                                    ")"),
+                                React.createElement("span", { className: "rmd-result-value" }, fmt(calculatedRMD)))),
+                            calculatedRMD > 0 && (React.createElement("div", { className: "rmd-override-hint" }, "\u2191 Used automatically below \u2014 override by entering a manual RMD amount"))),
+                        React.createElement(InputField, { label: "RMD Override (leave blank to use calculated)", value: rmds, onChange: setRMDs, hint: "Only enter if overriding the calculated RMD above" }),
+                        React.createElement(InputField, { label: "QCDs (Qualified Charitable)", value: qcds, onChange: setQCDs, hint: "Reduces taxable RMDs \u00B7 2026 limit: $105,000" }),
+                        React.createElement(InputField, { label: "Roth Conversion Amount", value: roth, onChange: setRoth, hint: "Enter a conversion to see tax impact" }))),
+                React.createElement("div", { className: "card results-card" },
+                    React.createElement("div", { className: "card-header" },
+                        React.createElement("span", { className: "card-icon" }, "\uD83D\uDCCA"),
+                        React.createElement("h2", null, "Tax Analysis & Conversion Room"),
+                        React.createElement("div", { className: "bracket-toggle" },
+                            React.createElement("span", { className: "toggle-label" }, "Target Bracket:"),
+                            [12, 22].map(b => (React.createElement("button", { key: b, className: `toggle-btn ${targetBracket === b ? "active" : ""}`, onClick: () => setTargetBracket(b) },
+                                b,
+                                "%"))))),
+                    React.createElement("div", { className: "card-body" },
+                        React.createElement("div", { className: "results-grid" },
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Provisional Income"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.provisionalIncome)),
+                                React.createElement("div", { className: "stat-sub" }, "For SS taxation calc")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Taxable Social Security"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.taxSSAmt)),
+                                React.createElement("div", { className: "stat-sub" },
+                                    results.taxSSPct,
+                                    "% of gross SS included")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "QCD Offset Applied"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.qcdApplied)),
+                                React.createElement("div", { className: "stat-sub" }, "Reduces taxable RMD")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Adjusted Gross Income"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.agi)),
+                                React.createElement("div", { className: "stat-sub" }, "Before standard deduction")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Taxable Income"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.taxableIncome)),
+                                React.createElement("div", { className: "stat-sub" },
+                                    "After ",
+                                    fmt(results.totalDeduction),
+                                    " total deduction")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Est. Federal Tax"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.taxOwed)),
+                                React.createElement("div", { className: "stat-sub" },
+                                    (results.effectiveRate * 100).toFixed(1),
+                                    "% effective rate \u00B7 ",
+                                    results.marginalBracket,
+                                    " marginal"))),
+                        React.createElement("div", { className: "waterfall" },
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "NASA Pension"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.pension))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" },
+                                    "Taxable Social Security ",
+                                    React.createElement("span", { className: "wf-note" },
+                                        "(",
+                                        results.taxSSPct,
+                                        "%)")),
+                                React.createElement("span", { className: "wf-value" }, fmt(results.taxSSAmt))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Ordinary Dividends"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.dividends))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Capital Gains"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.capGains))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Interest Income"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.interest))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" },
+                                    "Taxable RMDs ",
+                                    React.createElement("span", { className: "wf-note" }, "(after QCD)")),
+                                React.createElement("span", { className: "wf-value" }, fmt(results.taxableRMD))),
+                            inputs.roth > 0 && (React.createElement("div", { className: "wf-row roth-row" },
+                                React.createElement("span", { className: "wf-label" }, "Roth Conversion"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.roth)))),
+                            React.createElement("div", { className: "wf-row total" },
+                                React.createElement("span", { className: "wf-label" }, "= Adjusted Gross Income"),
+                                React.createElement("span", { className: "wf-value" }, fmt(results.agi))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Standard Deduction (Single 2026)"),
+                                React.createElement("span", { className: "wf-value deduct" },
+                                    "\u2212 ",
+                                    fmt(results.stdDeduction))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Additional Deduction (Age 65+)"),
+                                React.createElement("span", { className: "wf-value deduct" },
+                                    "\u2212 ",
+                                    fmt(results.over65Extra))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" },
+                                    "OBBB Senior Deduction ",
+                                    React.createElement("span", { className: "wf-note" }, results.agi > OBBB_PHASEOUT_START ? `(phased from $6,000)` : `(full)`)),
+                                React.createElement("span", { className: `wf-value ${results.obbDeduction > 0 ? "deduct" : "zero"}` }, results.obbDeduction > 0 ? `− ${fmt(results.obbDeduction)}` : "— phased out")),
+                            React.createElement("div", { className: "wf-row total" },
+                                React.createElement("span", { className: "wf-label" }, "= Taxable Income"),
+                                React.createElement("span", { className: "wf-value" }, fmt(results.taxableIncome)))),
+                        React.createElement("div", { className: "conversion-box" },
+                            React.createElement("div", { className: "conversion-icon" }, "\uD83D\uDD04"),
+                            React.createElement("div", { className: "conversion-main" },
+                                React.createElement("h3", null,
+                                    "Available Room in ",
+                                    targetBracket,
+                                    "% Bracket"),
+                                React.createElement("div", { className: "conversion-amount" }, fmt(results.additionalRoom)),
+                                React.createElement("div", { className: "conversion-sub" }, results.additionalRoom > 0
+                                    ? `Additional conversion stays in the ${targetBracket}% bracket`
+                                    : "Taxable income already at or above the 12% ceiling")),
+                            React.createElement("div", { className: "conversion-details" },
+                                React.createElement("div", { className: "cd-row" },
+                                    React.createElement("span", { className: "cd-label" },
+                                        targetBracket,
+                                        "% Bracket Ceiling"),
+                                    React.createElement("span", { className: "cd-value" }, fmt(results.bracketCeiling))),
+                                React.createElement("div", { className: "cd-row" },
+                                    React.createElement("span", { className: "cd-label" }, "Current Taxable Income"),
+                                    React.createElement("span", { className: "cd-value" }, fmt(results.taxableIncome))),
+                                React.createElement("div", { className: "cd-row" },
+                                    React.createElement("span", { className: "cd-label" }, "Remaining Room"),
+                                    React.createElement("span", { className: "cd-value gold" }, fmt(results.additionalRoom))),
+                                React.createElement("div", { className: "cd-row" },
+                                    React.createElement("span", { className: "cd-label" }, "Marginal Bracket"),
+                                    React.createElement("span", { className: "cd-value" }, results.marginalBracket)),
+                                React.createElement("div", { className: "cd-row" },
+                                    React.createElement("span", { className: "cd-label" }, "Total Deductions (Age 79)"),
+                                    React.createElement("span", { className: "cd-value" }, fmt(results.totalDeduction))))))),
+                React.createElement("div", { className: "card state-tax-card" },
+                    React.createElement("div", { className: "card-header" },
+                        React.createElement("span", { className: "card-icon" }, "\uD83C\uDFDB\uFE0F"),
+                        React.createElement("h2", null, "Alabama State Income Tax"),
+                        React.createElement("span", { className: "al-flag" }, "AL \u00B7 Single \u00B7 Age 79")),
+                    React.createElement("div", { className: "card-body" },
+                        React.createElement("div", { className: "al-grid" },
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Alabama AGI"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.alAGI)),
+                                React.createElement("div", { className: "stat-sub" }, "SS exempt \u00B7 Pension exempt")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Age-65 Retirement Exclusion"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.alRMDExclusion)),
+                                React.createElement("div", { className: "stat-sub" }, "Applied to RMD / IRA income")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "AL Standard Ded. + Exemption"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.alStdDed + 1500)),
+                                React.createElement("div", { className: "stat-sub" },
+                                    fmt(results.alStdDed),
+                                    " std + $1,500 personal")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "Federal Tax Deduction"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.taxOwed)),
+                                React.createElement("div", { className: "stat-sub" }, "AL uniquely allows this deduction")),
+                            React.createElement("div", { className: "stat-box" },
+                                React.createElement("div", { className: "stat-label" }, "AL Taxable Income"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.alTaxableIncome)),
+                                React.createElement("div", { className: "stat-sub" }, "After all AL deductions")),
+                            React.createElement("div", { className: "stat-box positive" },
+                                React.createElement("div", { className: "stat-label" }, "Alabama Tax Owed"),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.alTax)),
+                                React.createElement("div", { className: "stat-sub" }, "2% / 4% / 5% brackets"))),
+                        React.createElement("div", { className: "al-waterfall" },
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" },
+                                    "Social Security ",
+                                    React.createElement("span", { className: "wf-note" }, "(fully exempt in AL)")),
+                                React.createElement("span", { className: "wf-value zero" }, "\u2014 exempt")),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" },
+                                    "NASA Pension ",
+                                    React.createElement("span", { className: "wf-note" }, "(govt DB \u2014 fully exempt)")),
+                                React.createElement("span", { className: "wf-value zero" }, "\u2014 exempt")),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Dividends / Cap Gains / Interest"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.dividends + inputs.capGains + inputs.interest))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" },
+                                    "Taxable RMD (after QCD) ",
+                                    React.createElement("span", { className: "wf-note" }, "(\u2212$6k age-65 exclusion)")),
+                                React.createElement("span", { className: "wf-value" }, fmt(Math.max(0, results.taxableRMD - results.alRMDExclusion)))),
+                            inputs.roth > 0 && React.createElement("div", { className: "wf-row roth-row" },
+                                React.createElement("span", { className: "wf-label" }, "Roth Conversion"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.roth))),
+                            React.createElement("div", { className: "wf-row total" },
+                                React.createElement("span", { className: "wf-label" }, "= Alabama AGI"),
+                                React.createElement("span", { className: "wf-value" }, fmt(results.alAGI))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "AL Standard Deduction"),
+                                React.createElement("span", { className: "wf-value deduct" },
+                                    "\u2212 ",
+                                    fmt(results.alStdDed))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Personal Exemption"),
+                                React.createElement("span", { className: "wf-value deduct" },
+                                    "\u2212 ",
+                                    fmt(1500))),
+                            React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "Federal Taxes Paid (AL deduction)"),
+                                React.createElement("span", { className: "wf-value deduct" },
+                                    "\u2212 ",
+                                    fmt(results.taxOwed))),
+                            React.createElement("div", { className: "wf-row total" },
+                                React.createElement("span", { className: "wf-label" }, "= Alabama Taxable Income"),
+                                React.createElement("span", { className: "wf-value" }, fmt(results.alTaxableIncome)))),
+                        React.createElement("div", { className: "combined-banner", style: { marginTop: "20px" } },
+                            React.createElement("div", { className: "combined-item" },
+                                React.createElement("div", { className: "combined-label" }, "Federal Tax"),
+                                React.createElement("div", { className: "combined-value" }, fmt(results.taxOwed))),
+                            React.createElement("div", { className: "combined-divider" }),
+                            React.createElement("div", { className: "combined-item" },
+                                React.createElement("div", { className: "combined-label" }, "Alabama Tax"),
+                                React.createElement("div", { className: "combined-value" }, fmt(results.alTax))),
+                            React.createElement("div", { className: "combined-divider" }),
+                            React.createElement("div", { className: "combined-item" },
+                                React.createElement("div", { className: "combined-label" }, "Total Tax Burden"),
+                                React.createElement("div", { className: "combined-value big" }, fmt(results.combinedTax))),
+                            React.createElement("div", { className: "combined-divider" }),
+                            React.createElement("div", { className: "combined-item" },
+                                React.createElement("div", { className: "combined-label" }, "Combined Eff. Rate"),
+                                React.createElement("div", { className: "combined-value" },
+                                    (results.combinedEffRate * 100).toFixed(1),
+                                    "%")))))),
+            React.createElement("p", { className: "footnote" }, "Federal: Rev. Proc. 2025-32 \u00B7 $16,100 std ded + $2,050 over-65 + up to $6,000 OBBB senior ded (phases out above $75k) \u00B7 12% ceiling: $50,400 \u00B7 22%: $105,700 \u00B7 SS thresholds: 50% at $25k, 85% at $34k provisional \u00B7 QCD limit: $105,000 \u00B7 Alabama: SS fully exempt \u00B7 NASA pension (govt DB) fully exempt \u00B7 $6,000 age-65 retirement exclusion on IRA/RMD \u00B7 Standard ded $2,000\u2013$4,500 based on income \u00B7 $1,500 personal exemption \u00B7 Federal taxes paid are deductible in AL \u00B7 Rates: 2% / 4% / 5% \u00B7 Not tax advice \u2014 consult a CPA or tax professional."))));
+}
+ReactDOM.render(React.createElement(RothPlanner), document.getElementById('root'));
+
+    ReactDOM.render(React.createElement(RothPlanner), document.getElementById('root'));
+  </script>
+</body>
+</html>
