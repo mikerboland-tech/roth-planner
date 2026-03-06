@@ -306,8 +306,7 @@ function RothPlanner() {
     // ── Import scenarios from a JSON file ─────────────────────────────────────
     const handleImport = (e) => {
         const file = e.target.files[0];
-        if (!file)
-            return;
+        if (!file) return;
         const reader = new FileReader();
         reader.onload = (ev) => {
             try {
@@ -315,14 +314,34 @@ function RothPlanner() {
                 const merged = Object.assign(Object.assign({}, savedScenarios), imported);
                 lsSet(STORAGE_KEY, JSON.stringify(merged));
                 setSavedScenarios(merged);
-                flashMsg(`Imported ${Object.keys(imported).length} scenario(s) ✓`);
+                // Auto-load the first imported scenario directly into the fields
+                const firstName = Object.keys(imported)[0];
+                if (firstName) {
+                    const s = imported[firstName];
+                    setSS(s.ss != null ? s.ss : "");
+                    setPension(s.pension != null ? s.pension : "");
+                    setDiv(s.dividends != null ? s.dividends : "");
+                    setCG(s.capGains != null ? s.capGains : "");
+                    setInt(s.interest != null ? s.interest : "");
+                    setRMDs(s.rmds != null ? s.rmds : "");
+                    setQCDs(s.qcds != null ? s.qcds : "");
+                    setRoth(s.roth != null ? s.roth : "");
+                    if (s.targetBracket) setTargetBracket(s.targetBracket);
+                    if (s.age) setAge(s.age);
+                    if (s.accountValue !== undefined) setAccountValue(s.accountValue);
+                    setSaveName(firstName);
+                    const count = Object.keys(imported).length;
+                    flashMsg("Imported " + count + " scenario(s) — \"" + firstName + "\" loaded");
+                } else {
+                    flashMsg("Import failed — file appears empty.", "err");
+                }
             }
             catch (_) {
                 flashMsg("Import failed — invalid file.", "err");
             }
         };
         reader.readAsText(file);
-        e.target.value = ""; // reset input so same file can be re-imported
+        e.target.value = ""; // reset so same file can be re-imported
     };
     // ── Clear ALL saved scenarios from localStorage ───────────────────────────
     const handleClearAllScenarios = () => {
