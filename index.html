@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Roth Conversion Planner · 2026 · Alabama</title>
+  <title>2026 Tax & Roth Conversion Estimator</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <style>
@@ -52,7 +52,7 @@ function calcRMD(accountValue, age) {
     var _a;
     const av = parseFloat(String(accountValue).replace(/[^0-9.]/g, ""));
     const a = parseInt(age);
-    if (!av || !a || a < 72)
+    if (!av || !a || a < 73) // SECURE 2.0: RMDs begin at age 73
         return 0;
     const divisor = (_a = ULT[Math.min(a, 120)]) !== null && _a !== void 0 ? _a : 2.0;
     return av / divisor;
@@ -101,12 +101,12 @@ function calcALStandardDeduction(alAGI) {
         return 2500;
     return 2000; // $51,000+
 }
-// Alabama income tax calculation for single filer, age 65+, NASA pension
+// Alabama income tax calculation — filing status aware
 // Key exemptions: SS fully exempt, government DB pension exempt, age-65 $6k retirement exclusion
 // Key deduction: federal income taxes paid (deductible in Alabama — unique provision)
 function calcAlabamaTax({ pensionAmt, divAmt, cgAmt, intAmt, taxableRMD, rothAmt, k1Amt = 0, federalTaxPaid }) {
     // SS is fully exempt in Alabama — not included
-    // NASA pension (defined benefit government plan) is fully exempt in Alabama
+    // Government DB pension is fully exempt in Alabama
     // IRA/RMD distributions: taxable, but age 65+ may exclude up to $6,000
     const rmdAfterExclusion = Math.max(0, taxableRMD - AL_RETIREMENT_EXCLUSION);
     // Alabama AGI (no SS, no pension, RMD with exclusion applied)
@@ -169,6 +169,74 @@ function taxableSS(ssGross, provisionalIncome) {
     const tier2 = Math.min(ssGross * 0.85 - tier1, (provisionalIncome - SS_THRESH_85) * 0.85);
     return Math.min(ssGross * 0.85, tier1 + tier2);
 }
+// ─── Filing-Status-Aware Helper Wrappers ─────────────────────────────────────
+function taxableSSFS(ssGross, provisionalIncome, thr50, thr85) {
+  if (provisionalIncome <= thr50) return 0;
+  if (provisionalIncome <= thr85) {
+    return Math.min(ssGross * 0.50, (provisionalIncome - thr50) * 0.50);
+  }
+  const tier1 = Math.min(ssGross * 0.50, (thr85 - thr50) * 0.50);
+  const tier2 = Math.min(ssGross * 0.85 - tier1, (provisionalIncome - thr85) * 0.85);
+  return Math.min(ssGross * 0.85, tier1 + tier2);
+}
+
+function calcOBBBDeductionFS(magi, phaseStart) {
+  if (magi <= phaseStart) return OBBB_SENIOR_MAX;
+  const reduction = (magi - phaseStart) * OBBB_PHASEOUT_RATE;
+  return Math.max(0, OBBB_SENIOR_MAX - reduction);
+}
+
+function calcTaxFS(taxableIncome, brackets) {
+  if (taxableIncome <= 0) return 0;
+  let tax = 0;
+  for (const b of brackets) {
+    if (taxableIncome <= b.floor) break;
+    const amount = Math.min(taxableIncome, b.ceiling) - b.floor;
+    tax += amount * b.rate;
+  }
+  return tax;
+}
+
+function calcQBIFS(k1Income, taxableIncomeBeforeQBI, threshold, upperLimit) {
+  if (k1Income < QBI_MIN_INCOME) return 0;
+  const tentative = k1Income * 0.20;
+  let deduction = taxableIncomeBeforeQBI >= tentative ? tentative : taxableIncomeBeforeQBI;
+  if (taxableIncomeBeforeQBI > upperLimit) {
+    deduction = 0;
+  } else if (taxableIncomeBeforeQBI > threshold) {
+    const range = upperLimit - threshold;
+    const excess = taxableIncomeBeforeQBI - threshold;
+    deduction = deduction * (1 - excess / range);
+  }
+  if (deduction > 0 && deduction < QBI_MIN_DEDUCTION) deduction = QBI_MIN_DEDUCTION;
+  return Math.max(0, deduction);
+}
+
+function calcAlabamaTaxFS({ wagesAmt = 0, pensionAmt, divAmt, cgAmt, intAmt, taxableRMD, rothAmt, k1Amt = 0,
+                             federalTaxPaid, isMFJ, alPersonalExemption, calcALStdDedFS, is65Plus = false }) {
+  // SS fully exempt in Alabama regardless of filing status
+  // Government DB pension fully exempt in Alabama
+  // Wages are fully taxable in Alabama
+  // Age-65 retirement exclusion ($6k): only applies at age 65+
+  const alRetirementExclusion = is65Plus ? AL_RETIREMENT_EXCLUSION : 0;
+  const rmdAfterExclusion = Math.max(0, taxableRMD - alRetirementExclusion);
+  const alAGI = wagesAmt + divAmt + cgAmt + intAmt + rmdAfterExclusion + rothAmt + k1Amt;
+  const stdDed = calcALStdDedFS(alAGI);
+  const totalDed = stdDed + alPersonalExemption + federalTaxPaid;
+  const alTaxableIncome = Math.max(0, alAGI - totalDed);
+  // Alabama brackets differ for MFJ
+  const alBrackets = isMFJ
+    ? [{ rate: 0.02, floor: 0, ceiling: 1000 }, { rate: 0.04, floor: 1000, ceiling: 6000 }, { rate: 0.05, floor: 6000, ceiling: Infinity }]
+    : AL_BRACKETS;
+  let tax = 0;
+  for (const b of alBrackets) {
+    if (alTaxableIncome <= b.floor) break;
+    const amount = Math.min(alTaxableIncome, b.ceiling) - b.floor;
+    tax += amount * b.rate;
+  }
+  return { alAGI, rmdAfterExclusion, stdDed, alTaxableIncome, alTax: tax };
+}
+
 // ─── InputField Component ─────────────────────────────────────────────────────
 function InputField({ label, value, onChange, hint }) {
     return (React.createElement("div", { className: "input-group" },
@@ -181,6 +249,7 @@ function InputField({ label, value, onChange, hint }) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 function RothPlanner() {
     var _a;
+    const [wages, setWages] = useState("");       // W-2 / ordinary earned income
     const [ss, setSS] = useState("");
     const [pension, setPension] = useState("");
     const [dividends, setDiv] = useState("");
@@ -189,10 +258,12 @@ function RothPlanner() {
     const [rmds, setRMDs] = useState("");
     const [qcds, setQCDs] = useState("");
     const [roth, setRoth] = useState("");
+    const [filingStatus, setFilingStatus] = useState("single"); // "single" | "mfj"
     const [targetBracket, setTargetBracket] = useState(12);
     const [age, setAge] = useState("79");
     const [accountValue, setAccountValue] = useState("");
     const [k1Income, setK1] = useState("");         // K-1 pass-through business income
+    const [spouse65, setSpouse65] = useState(true);  // Is spouse also 65+? (MFJ only)
     const [priorYearFed, setPriorYearFed] = useState("");   // Prior year federal tax (Form 1040 Line 24)
     const [priorYearAL, setPriorYearAL]   = useState("");   // Prior year Alabama tax (Form 40 Line 17)
     const [activeTab, setActiveTab] = useState("tax"); // "tax" | "estimated"
@@ -243,7 +314,7 @@ function RothPlanner() {
         setSaveMsg({ text, type });
         setTimeout(() => setSaveMsg(null), 2800);
     };
-    const currentValues = () => ({ ss, pension, dividends, capGains, interest, rmds, qcds, roth, targetBracket, age, accountValue, k1Income, priorYearFed, priorYearAL });
+    const currentValues = () => ({ wages, ss, pension, dividends, capGains, interest, rmds, qcds, roth, targetBracket, filingStatus, age, accountValue, k1Income, spouse65, priorYearFed, priorYearAL });
     const handleSave = () => {
         const name = saveName.trim();
         if (!name) {
@@ -260,6 +331,7 @@ function RothPlanner() {
         const s = savedScenarios[name];
         if (!s)
             return;
+        setWages(s.wages != null ? s.wages : "");
         setSS((_a = s.ss) !== null && _a !== void 0 ? _a : "");
         setPension((_b = s.pension) !== null && _b !== void 0 ? _b : "");
         setDiv((_c = s.dividends) !== null && _c !== void 0 ? _c : "");
@@ -276,6 +348,7 @@ function RothPlanner() {
             setAccountValue(s.accountValue);
         setLoadOpen(false);
         if (s.k1Income !== undefined) setK1(s.k1Income);
+        if (s.spouse65 !== undefined) setSpouse65(s.spouse65);
         if (s.priorYearFed !== undefined) setPriorYearFed(s.priorYearFed);
         if (s.priorYearAL  !== undefined) setPriorYearAL(s.priorYearAL);
         setSaveName(name);
@@ -289,6 +362,7 @@ function RothPlanner() {
         setSavedScenarios(updated);
     };
     const handleClear = () => {
+        setWages("");
         setSS("");
         setPension("");
         setDiv("");
@@ -298,8 +372,10 @@ function RothPlanner() {
         setQCDs("");
         setRoth("");
         setK1("");
+        setSpouse65(true);
         setPriorYearFed("");
         setPriorYearAL("");
+        setFilingStatus("single");
         setTargetBracket(12);
         setAge("");
         setAccountValue("");
@@ -360,6 +436,7 @@ function RothPlanner() {
                 const firstName = Object.keys(imported)[0];
                 if (firstName) {
                     const s = imported[firstName];
+                    setWages(s.wages != null ? s.wages : "");
                     setSS(s.ss != null ? s.ss : "");
                     setPension(s.pension != null ? s.pension : "");
                     setDiv(s.dividends != null ? s.dividends : "");
@@ -369,9 +446,11 @@ function RothPlanner() {
                     setQCDs(s.qcds != null ? s.qcds : "");
                     setRoth(s.roth != null ? s.roth : "");
                     if (s.targetBracket) setTargetBracket(s.targetBracket);
+                    if (s.filingStatus)   setFilingStatus(s.filingStatus);
                     if (s.age) setAge(s.age);
                     if (s.accountValue !== undefined) setAccountValue(s.accountValue);
                     if (s.k1Income !== undefined) setK1(s.k1Income);
+                    if (s.spouse65 !== undefined) setSpouse65(s.spouse65);
                     if (s.priorYearFed !== undefined) setPriorYearFed(s.priorYearFed);
         if (s.priorYearAL  !== undefined) setPriorYearAL(s.priorYearAL);
                     setSaveName(firstName);
@@ -399,6 +478,7 @@ function RothPlanner() {
     const accountValueNum = parseDollar(accountValue);
     const calculatedRMD = calcRMD(accountValueNum, ageNum);
     const inputs = {
+        wages: parseDollar(wages),
         ss: parseDollar(ss),
         pension: parseDollar(pension),
         dividends: parseDollar(dividends),
@@ -408,51 +488,98 @@ function RothPlanner() {
         qcds: parseDollar(qcds),
         roth: parseDollar(roth),
         k1Income: parseDollar(k1Income),
+        filingStatus,
         priorYearFed: parseDollar(priorYearFed),
         priorYearAL:  parseDollar(priorYearAL),
     };
     const results = useMemo(() => {
-        const { ss: ssAmt, pension: pensionAmt, dividends: divAmt, capGains: cgAmt, interest: intAmt, rmds: rmdAmt, qcds: qcdAmt, roth: rothAmt, k1Income: k1Amt, priorYearFed: priorFed, priorYearAL: priorAL } = inputs;
+        const { wages: wagesAmt, ss: ssAmt, pension: pensionAmt, dividends: divAmt, capGains: cgAmt, interest: intAmt, rmds: rmdAmt, qcds: qcdAmt, roth: rothAmt, k1Income: k1Amt, filingStatus: fs, priorYearFed: priorFed, priorYearAL: priorAL } = inputs;
+        const isMFJ = fs === "mfj";
+
+        // ── Filing-status-aware federal parameters (2026, Rev. Proc. 2025-32) ──
+        const stdDedFed   = isMFJ ? 32200  : 16100;   // Standard deduction
+        const is65Plus    = ageNum >= 65;               // Both federal age-gated deductions require age 65+
+        const over65Extra = is65Plus
+            ? (isMFJ ? (1650 + (spouse65 ? 1650 : 0)) : 2050)  // IRS additional std ded: $1,650/spouse (MFJ) or $2,050 (single)
+            : 0;
+        const obbPhaseStart = isMFJ ? 150000 : 75000;  // OBBB senior ded phaseout start
+        const ssThr50     = isMFJ ? 32000  : 25000;    // SS provisional income 50% threshold
+        const ssThr85     = isMFJ ? 44000  : 34000;    // SS provisional income 85% threshold
+        // Federal brackets
+        const brackets    = isMFJ ? [
+          { rate: 0.10, floor: 0,       ceiling: 23200  },
+          { rate: 0.12, floor: 23200,   ceiling: 94300  },
+          { rate: 0.22, floor: 94300,   ceiling: 201050 },
+          { rate: 0.24, floor: 201050,  ceiling: 383900 },
+          { rate: 0.32, floor: 383900,  ceiling: 487450 },
+          { rate: 0.35, floor: 487450,  ceiling: 731200 },
+          { rate: 0.37, floor: 731200,  ceiling: Infinity },
+        ] : BRACKETS;
+        const bracketCeilings = isMFJ ? { 12: 94300, 22: 201050 } : BRACKET_CEILINGS;
+        // QBI thresholds
+        const qbiThreshold = isMFJ ? 394600 : 197300;
+        const qbiUpperLimit = isMFJ ? 544600 : 272300;
+        // Safe harbor AGI threshold (110% kicks in above $150k for single, $150k for MFJ same rule)
+        const safeHarborAGIThresh = 150000;
+        // AL personal exemption
+        const alPersonalExemption = isMFJ ? 3000 : 1500;
+        // AL standard deduction (MFJ: max $8,500 phases down)
+        const calcALStdDedFS = (alAGI) => {
+          if (isMFJ) {
+            if (alAGI <= 20000)  return 8500;
+            if (alAGI <= 30000)  return 7500;
+            if (alAGI <= 50000)  return 6500;
+            return 5500;
+          }
+          return calcALStandardDeduction(alAGI);
+        };
         // QCDs reduce taxable RMDs (up to RMD amount, max $105k in 2026)
         const qcdApplied = Math.min(qcdAmt, rmdAmt, 105000);
         const taxableRMD = rmdAmt - qcdApplied;
-        const provisionalIncome = pensionAmt + divAmt + cgAmt + intAmt + taxableRMD + rothAmt + k1Amt + ssAmt * 0.5;
-        const taxSSAmt = taxableSS(ssAmt, provisionalIncome);
+        const provisionalIncome = wagesAmt + pensionAmt + divAmt + cgAmt + intAmt + taxableRMD + rothAmt + k1Amt + ssAmt * 0.5;
+        // Use filing-status-aware SS thresholds
+        const ss50 = ssThr50; const ss85 = ssThr85;
+        const taxSSAmt = taxableSSFS(ssAmt, provisionalIncome, ss50, ss85);
         // AGI
-        const agi = taxSSAmt + pensionAmt + divAmt + cgAmt + intAmt + taxableRMD + rothAmt + k1Amt;
+        const agi = wagesAmt + taxSSAmt + pensionAmt + divAmt + cgAmt + intAmt + taxableRMD + rothAmt + k1Amt;
         // OBBB $6,000 senior deduction with phaseout based on MAGI (≈ AGI here)
-        const obbDeduction = calcOBBBDeduction(agi);
-        const totalDeduction = STANDARD_DEDUCTION_SINGLE + OVER_65_EXTRA + obbDeduction;
+        const obbDeduction = is65Plus ? calcOBBBDeductionFS(agi, obbPhaseStart) : 0;
+        const totalDeduction = stdDedFed + over65Extra + obbDeduction;
         // Taxable income before QBI deduction
         const taxableBeforeQBI = Math.max(0, agi - totalDeduction);
         // QBI deduction on K-1 pass-through income (§199A)
-        const qbiDeduction = calcQBI(k1Amt, taxableBeforeQBI);
+        const qbiDeduction = calcQBIFS(k1Amt, taxableBeforeQBI, qbiThreshold, qbiUpperLimit);
         const taxableIncome = Math.max(0, taxableBeforeQBI - qbiDeduction);
-        const taxOwed = calcTax(taxableIncome);
+        const taxOwed = calcTaxFS(taxableIncome, brackets);
         const effectiveRate = agi > 0 ? taxOwed / agi : 0;
         // Room in selected bracket
-        const bracketCeiling = BRACKET_CEILINGS[targetBracket];
+        const bracketCeiling = bracketCeilings[targetBracket];
         const additionalRoom = Math.max(0, bracketCeiling - taxableIncome);
         // Marginal bracket
         let marginalBracket = "10%";
-        for (const b of [...BRACKETS].reverse()) {
+        for (const b of [...brackets].reverse()) {
             if (taxableIncome > b.floor) {
                 marginalBracket = `${(b.rate * 100).toFixed(0)}%`;
                 break;
             }
         }
         // ── Alabama State Tax ──────────────────────────────────────────────────
-        const alResult = calcAlabamaTax({
-            pensionAmt, divAmt, cgAmt, intAmt, taxableRMD, rothAmt, k1Amt,
-            federalTaxPaid: taxOwed, // AL allows deduction of federal taxes paid
+        const alResult = calcAlabamaTaxFS({
+            wagesAmt, pensionAmt, divAmt, cgAmt, intAmt, taxableRMD, rothAmt, k1Amt,
+            federalTaxPaid: taxOwed, isMFJ, alPersonalExemption, calcALStdDedFS, is65Plus,
         });
         const combinedTax = taxOwed + alResult.alTax;
         const combinedEffRate = agi > 0 ? combinedTax / agi : 0;
+        // ── IRMAA thresholds (2026 projected) ────────────────────────────────
+        // Medicare Part B/D surcharge kicks in at these MAGI levels
+        const irmaaThreshold = isMFJ ? 212000 : 106000;
+        const irmaaExceeded = agi > irmaaThreshold;
+        const irmaaRoom = Math.max(0, irmaaThreshold - agi);
         // ── Estimated Quarterly Taxes ─────────────────────────────────────────
         // Safe harbor: 100% of prior year tax (110% if prior AGI > $150k)
         // Using 110% threshold conservatively since pension income likely > $150k AGI
         const priorTotalTax = priorFed + priorAL;
-        const safeHarborMultiplier = agi > 150000 ? 1.10 : 1.00;
+        const safeHarborMultiplier = agi > safeHarborAGIThresh ? 1.10 : 1.00;
         const safeHarborAnnual = priorTotalTax * safeHarborMultiplier;
         const safeHarborQuarterly = safeHarborAnnual / 4;
         // Current year method: 90% of projected total tax
@@ -469,20 +596,22 @@ function RothPlanner() {
             taxableRMD, qcdApplied,
             agi, taxableIncome, taxOwed, effectiveRate,
             additionalRoom, marginalBracket, bracketCeiling,
-            obbDeduction, totalDeduction, stdDeduction: STANDARD_DEDUCTION_SINGLE, over65Extra: OVER_65_EXTRA,
+            obbDeduction, totalDeduction, stdDeduction: stdDedFed, over65Extra, isMFJ, is65Plus,
             qbiDeduction, taxableBeforeQBI,
             // Alabama
             alAGI: alResult.alAGI,
             alStdDed: alResult.stdDed,
             alTaxableIncome: alResult.alTaxableIncome,
             alTax: alResult.alTax,
-            alRMDExclusion: Math.min(inputs.rmds || calculatedRMD, AL_RETIREMENT_EXCLUSION),
+            alPersonalExemption,
+            alRMDExclusion: is65Plus ? Math.min(inputs.rmds || calculatedRMD, AL_RETIREMENT_EXCLUSION) : 0,
             combinedTax, combinedEffRate,
+            irmaaThreshold, irmaaExceeded, irmaaRoom,
             safeHarborAnnual, safeHarborQuarterly, currentYearMethod, currentYearQuarterly,
             recommendedAnnual, recommendedQuarterly, needsEstimatedTax, priorTotalTax, priorFed, priorAL,
         };
         // calculatedRMD exposed directly via outer scope
-    }, [inputs, targetBracket, ageNum]);
+    }, [inputs.wages, inputs.ss, inputs.pension, inputs.dividends, inputs.capGains, inputs.interest, inputs.rmds, inputs.qcds, inputs.roth, inputs.k1Income, inputs.filingStatus, inputs.priorYearFed, inputs.priorYearAL, targetBracket, ageNum, spouse65]);
     return (React.createElement(React.Fragment, null,
         React.createElement("style", null, `
         @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Source+Sans+3:wght@300;400;500;600&display=swap');
@@ -549,13 +678,13 @@ function RothPlanner() {
         .card-icon { font-size: 1rem; opacity: 0.8; }
         .bracket-toggle { margin-left: auto; display: flex; align-items: center; gap: 6px; }
         .toggle-label { font-size: 0.72rem; color: rgba(255,255,255,0.55); text-transform: uppercase; letter-spacing: 0.07em; }
-        .toggle-btn {
+        .toggle-btn, .bracket-btn {
           padding: 4px 14px; border-radius: 20px; border: 1.5px solid rgba(201,168,76,0.45);
           background: transparent; color: rgba(255,255,255,0.65); font-size: 0.82rem; font-weight: 600;
           cursor: pointer; font-family: inherit; transition: all 0.15s;
         }
-        .toggle-btn:hover { border-color: var(--gold2); color: #fff; }
-        .toggle-btn.active { background: var(--gold); border-color: var(--gold); color: var(--navy); }
+        .toggle-btn:hover, .bracket-btn:hover { border-color: var(--gold2); color: #fff; }
+        .toggle-btn.active, .bracket-btn.active { background: var(--gold); border-color: var(--gold); color: var(--navy); }
         .card-body { padding: 20px; }
 
         /* Inputs */
@@ -784,10 +913,21 @@ function RothPlanner() {
         React.createElement("div", { className: "app" },
             React.createElement("div", { className: "header" },
                 React.createElement("div", { className: "header-seal" }, "\uD83C\uDFDB\uFE0F"),
-                React.createElement("h1", null, "Roth Conversion Planner"),
-                React.createElement("p", null, `2026 Tax Year · Single Filer · Age ${ageNum || 79} · NASA Pension`),
+                React.createElement("h1", null, "Tax & Roth Conversion Estimator"),
+                React.createElement("p", null, `2026 Tax Year · ${filingStatus === "mfj" ? "Married Filing Jointly" : "Single Filer"} · Age ${ageNum || 79}`),
                 React.createElement("div", { className: "gold-rule" })),
             React.createElement("div", { className: "savebar" },
+                React.createElement("div", { style: {display:"flex", alignItems:"center", gap:"8px", marginRight:"8px"} },
+                    React.createElement("span", { className: "savebar-label" }, "Filing Status:"),
+                    React.createElement("div", { className: "bracket-toggle" },
+                        React.createElement("button", {
+                            className: `bracket-btn ${filingStatus === "single" ? "active" : ""}`,
+                            onClick: () => setFilingStatus("single")
+                        }, "Single"),
+                        React.createElement("button", {
+                            className: `bracket-btn ${filingStatus === "mfj" ? "active" : ""}`,
+                            onClick: () => setFilingStatus("mfj")
+                        }, "MFJ"))),
                 React.createElement("span", { className: "savebar-label" }, "Scenario:"),
                 React.createElement("input", { type: "text", placeholder: "Name this scenario\u2026", value: saveName, onChange: e => setSaveName(e.target.value), onKeyDown: e => e.key === "Enter" && handleSave() }),
                 React.createElement("button", { className: "savebar-btn primary", onClick: handleSave }, "Save"),
@@ -822,8 +962,9 @@ function RothPlanner() {
                         React.createElement("span", { className: "card-icon" }, "\uD83D\uDCCB"),
                         React.createElement("h2", null, "Income Sources")),
                     React.createElement("div", { className: "card-body" },
+                        React.createElement(InputField, { label: "W-2 / Ordinary Wages", value: wages, onChange: setWages, hint: "Fully taxable federal and state \u00B7 Include salary, hourly wages, tips" }),
                         React.createElement(InputField, { label: "Social Security (Annual Gross)", value: ss, onChange: setSS, hint: "50\u201385% may be taxable based on provisional income" }),
-                        React.createElement(InputField, { label: "NASA Pension", value: pension, onChange: setPension, hint: "Fully taxable ordinary income" }),
+                        React.createElement(InputField, { label: "Pension (Defined Benefit)", value: pension, onChange: setPension, hint: "Government/corporate defined benefit pension \u00B7 Fully exempt in Alabama" }),
                         React.createElement(InputField, { label: "Ordinary Dividends", value: dividends, onChange: setDiv }),
                         React.createElement(InputField, { label: "Long-Term Capital Gains", value: capGains, onChange: setCG, hint: "Preferential rate (simplified as ordinary here)" }),
                         React.createElement(InputField, { label: "Interest Income", value: interest, onChange: setInt }),
@@ -838,10 +979,10 @@ function RothPlanner() {
                             React.createElement("div", { className: "rmd-inputs-row" },
                                 React.createElement("div", { className: "rmd-age-field" },
                                     React.createElement("label", null, "Current Age"),
-                                    React.createElement("input", { type: "number", min: "72", max: "120", value: age, onChange: e => setAge(e.target.value), className: "age-input" })),
+                                    React.createElement("input", { type: "number", min: "1", max: "120", value: age, onChange: e => setAge(e.target.value), className: "age-input" })),
                                 React.createElement("div", { className: "rmd-acct-field" },
                                     React.createElement("label", null, "Total RMD-Eligible Accounts",
-                                        ageNum >= 72 && !accountValue && React.createElement("span", { style: { color: "var(--gold2)", fontSize: "0.75rem", marginLeft: "8px", fontWeight: 600 } }, "← Enter to calculate RMD")),
+                                        ageNum >= 73 && !accountValue && React.createElement("span", { style: { color: "var(--gold2)", fontSize: "0.75rem", marginLeft: "8px", fontWeight: 600 } }, "← Enter to calculate RMD")),
                                     React.createElement("div", { className: "input-wrap" },
                                         React.createElement("span", { className: "dollar-sign" }, "$"),
                                         React.createElement("input", { type: "text", value: accountValue, onChange: e => setAccountValue(e.target.value), placeholder: "Enter account balance" })))),
@@ -854,7 +995,22 @@ function RothPlanner() {
                                 React.createElement("span", { className: "rmd-result-value" }, fmt(calculatedRMD)))),
                             calculatedRMD > 0 && (React.createElement("div", { className: "rmd-override-hint" }, "\u2191 Used automatically below \u2014 override by entering a manual RMD amount"))),
                         React.createElement(InputField, { label: "RMD Override (leave blank to use calculated)", value: rmds, onChange: setRMDs, hint: "Only enter if overriding the calculated RMD above" }),
-                        React.createElement(InputField, { label: "QCDs (Qualified Charitable)", value: qcds, onChange: setQCDs, hint: "Reduces taxable RMDs \u00B7 2026 limit: $105,000" }),
+                        filingStatus === "mfj" && React.createElement("div", { className: "rmd-section", style: { marginBottom: "14px", padding: "10px 16px" } },
+                            React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between" } },
+                                React.createElement("span", { style: { fontSize: "0.78rem", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--muted)" } }, "Spouse Also 65+?"),
+                                React.createElement("div", { className: "bracket-toggle" },
+                                    React.createElement("button", { className: `toggle-btn ${spouse65 ? "active" : ""}`, onClick: () => setSpouse65(true) }, "Yes"),
+                                    React.createElement("button", { className: `toggle-btn ${!spouse65 ? "active" : ""}`, onClick: () => setSpouse65(false) }, "No"))),
+                            React.createElement("div", { className: "hint" }, spouse65
+                                ? "Both spouses 65+ → additional standard deduction of $3,300 ($1,650 × 2)"
+                                : "Only primary filer 65+ → additional standard deduction of $1,650")),
+                        React.createElement("div", { style: { opacity: ageNum > 0 && ageNum < 71 ? 0.4 : 1, pointerEvents: ageNum > 0 && ageNum < 71 ? "none" : "auto" } },
+                            React.createElement(InputField, {
+                                label: ageNum > 0 && ageNum < 71 ? "QCDs (Not eligible — requires age 70\u00BD+)" : "QCDs (Qualified Charitable)",
+                                value: qcds,
+                                onChange: setQCDs,
+                                hint: ageNum > 0 && ageNum < 71 ? "QCDs require age 70\u00BD or older" : "Reduces taxable RMDs \u00B7 2026 limit: $105,000"
+                            })),
                         React.createElement(InputField, { label: "Roth Conversion Amount", value: roth, onChange: setRoth, hint: "Enter a conversion to see tax impact" }),
                         React.createElement(InputField, { label: "Prior Year Federal Tax", value: priorYearFed, onChange: setPriorYearFed, hint: "From Form 1040 Line 24 (total tax)" }),
                         React.createElement(InputField, { label: "Prior Year Alabama Tax", value: priorYearAL,  onChange: setPriorYearAL,  hint: "From AL Form 40 Line 17 (net tax due)" }))),
@@ -903,8 +1059,11 @@ function RothPlanner() {
                                     results.marginalBracket,
                                     " marginal"))),
                         React.createElement("div", { className: "waterfall" },
+                            inputs.wages > 0 && React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "W-2 / Ordinary Wages"),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.wages))),
                             React.createElement("div", { className: "wf-row" },
-                                React.createElement("span", { className: "wf-label" }, "NASA Pension"),
+                                React.createElement("span", { className: "wf-label" }, "Pension (Defined Benefit)"),
                                 React.createElement("span", { className: "wf-value" }, fmt(inputs.pension))),
                             React.createElement("div", { className: "wf-row" },
                                 React.createElement("span", { className: "wf-label" },
@@ -938,20 +1097,28 @@ function RothPlanner() {
                                 React.createElement("span", { className: "wf-label" }, "= Adjusted Gross Income"),
                                 React.createElement("span", { className: "wf-value" }, fmt(results.agi))),
                             React.createElement("div", { className: "wf-row" },
-                                React.createElement("span", { className: "wf-label" }, "Standard Deduction (Single 2026)"),
+                                React.createElement("span", { className: "wf-label" }, `Standard Deduction (${results.isMFJ ? "MFJ" : "Single"} 2026)`),
                                 React.createElement("span", { className: "wf-value deduct" },
                                     "\u2212 ",
                                     fmt(results.stdDeduction))),
-                            React.createElement("div", { className: "wf-row" },
-                                React.createElement("span", { className: "wf-label" }, "Additional Deduction (Age 65+)"),
-                                React.createElement("span", { className: "wf-value deduct" },
-                                    "\u2212 ",
-                                    fmt(results.over65Extra))),
-                            React.createElement("div", { className: "wf-row" },
+                            React.createElement("div", { className: "wf-row", style: {opacity: results.is65Plus ? 1 : 0.4} },
+                                React.createElement("span", { className: "wf-label" },
+                                    results.is65Plus
+                                        ? (results.isMFJ
+                                            ? `Additional Deduction (65+ × ${spouse65 ? "2 spouses" : "1 spouse"})`
+                                            : "Additional Deduction (Age 65+)")
+                                        : "Additional Deduction (Age 65+ — not yet eligible)"),
+                                React.createElement("span", { className: results.is65Plus ? "wf-value deduct" : "wf-value zero" },
+                                    results.is65Plus ? `\u2212 ${fmt(results.over65Extra)}` : "\u2014 n/a")),
+                            React.createElement("div", { className: "wf-row", style: {opacity: results.is65Plus ? 1 : 0.4} },
                                 React.createElement("span", { className: "wf-label" },
                                     "OBBB Senior Deduction ",
-                                    React.createElement("span", { className: "wf-note" }, results.agi > OBBB_PHASEOUT_START ? `(phased from $6,000)` : `(full)`)),
-                                React.createElement("span", { className: `wf-value ${results.obbDeduction > 0 ? "deduct" : "zero"}` }, results.obbDeduction > 0 ? `− ${fmt(results.obbDeduction)}` : "— phased out")),
+                                    React.createElement("span", { className: "wf-note" },
+                                        !results.is65Plus ? "(age 65+ required)" :
+                                        results.agi > (results.isMFJ ? 150000 : 75000) ? "(phased from $6,000)" : "(full)")),
+                                React.createElement("span", { className: `wf-value ${results.is65Plus && results.obbDeduction > 0 ? "deduct" : "zero"}` },
+                                    !results.is65Plus ? "\u2014 n/a" :
+                                    results.obbDeduction > 0 ? `\u2212 ${fmt(results.obbDeduction)}` : "\u2014 phased out")),
                             results.qbiDeduction > 0 && (React.createElement("div", { className: "wf-row" },
                                 React.createElement("span", { className: "wf-label" },
                                     "QBI Deduction (§199A) ",
@@ -989,12 +1156,26 @@ function RothPlanner() {
                                     React.createElement("span", { className: "cd-value" }, results.marginalBracket)),
                                 React.createElement("div", { className: "cd-row" },
                                     React.createElement("span", { className: "cd-label" }, `Total Deductions (Age ${ageNum || 79})`),
-                                    React.createElement("span", { className: "cd-value" }, fmt(results.totalDeduction))))))),
+                                    React.createElement("span", { className: "cd-value" }, fmt(results.totalDeduction)))))),
+                        React.createElement("div", { style: {
+                            marginTop: "16px", padding: "14px 18px", borderRadius: "8px",
+                            background: results.irmaaExceeded ? "var(--red-l)" : "var(--green-l)",
+                            border: `1px solid ${results.irmaaExceeded ? "rgba(139,44,44,0.3)" : "rgba(42,125,79,0.3)"}`,
+                            display: "flex", alignItems: "center", gap: "12px",
+                        }},
+                            React.createElement("span", { style: { fontSize: "1.3rem" } }, results.irmaaExceeded ? "\u26A0\uFE0F" : "\u2705"),
+                            React.createElement("div", null,
+                                React.createElement("div", { style: { fontSize: "0.78rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: results.irmaaExceeded ? "var(--red)" : "var(--green)", marginBottom: "2px" } },
+                                    results.irmaaExceeded ? "IRMAA Surcharge Triggered" : "Below IRMAA Threshold"),
+                                React.createElement("div", { style: { fontSize: "0.82rem", color: "var(--navy)" } },
+                                    results.irmaaExceeded
+                                        ? `MAGI of ${fmt(results.agi)} exceeds the ${fmt(results.irmaaThreshold)} threshold — Medicare Part B/D surcharges apply.`
+                                        : `${fmt(results.irmaaRoom)} of room before IRMAA kicks in at ${fmt(results.irmaaThreshold)} MAGI.`)))),
                 React.createElement("div", { className: "card state-tax-card" },
                     React.createElement("div", { className: "card-header" },
                         React.createElement("span", { className: "card-icon" }, "\uD83C\uDFDB\uFE0F"),
                         React.createElement("h2", null, "Alabama State Income Tax"),
-                        React.createElement("span", { className: "al-flag" }, `AL · Single · Age ${ageNum || 79}`)),
+                        React.createElement("span", { className: "al-flag" }, `AL · ${results.isMFJ ? "MFJ" : "Single"} · Age ${ageNum || 79}`)),
                     React.createElement("div", { className: "card-body" },
                         React.createElement("div", { className: "al-grid" },
                             React.createElement("div", { className: "stat-box" },
@@ -1007,10 +1188,10 @@ function RothPlanner() {
                                 React.createElement("div", { className: "stat-sub" }, "Applied to RMD / IRA income")),
                             React.createElement("div", { className: "stat-box" },
                                 React.createElement("div", { className: "stat-label" }, "AL Standard Ded. + Exemption"),
-                                React.createElement("div", { className: "stat-value" }, fmt(results.alStdDed + 1500)),
+                                React.createElement("div", { className: "stat-value" }, fmt(results.alStdDed + results.alPersonalExemption)),
                                 React.createElement("div", { className: "stat-sub" },
                                     fmt(results.alStdDed),
-                                    " std + $1,500 personal")),
+                                    ` std + ${fmt(results.alPersonalExemption)} personal`)),
                             React.createElement("div", { className: "stat-box" },
                                 React.createElement("div", { className: "stat-label" }, "Federal Tax Deduction"),
                                 React.createElement("div", { className: "stat-value" }, fmt(results.taxOwed)),
@@ -1024,6 +1205,9 @@ function RothPlanner() {
                                 React.createElement("div", { className: "stat-value" }, fmt(results.alTax)),
                                 React.createElement("div", { className: "stat-sub" }, "2% / 4% / 5% brackets"))),
                         React.createElement("div", { className: "al-waterfall" },
+                            inputs.wages > 0 && React.createElement("div", { className: "wf-row" },
+                                React.createElement("span", { className: "wf-label" }, "W-2 / Wages ", React.createElement("span", { className: "wf-note" }, "(taxable in AL)")),
+                                React.createElement("span", { className: "wf-value" }, fmt(inputs.wages))),
                             React.createElement("div", { className: "wf-row" },
                                 React.createElement("span", { className: "wf-label" },
                                     "Social Security ",
@@ -1031,8 +1215,8 @@ function RothPlanner() {
                                 React.createElement("span", { className: "wf-value zero" }, "\u2014 exempt")),
                             React.createElement("div", { className: "wf-row" },
                                 React.createElement("span", { className: "wf-label" },
-                                    "NASA Pension ",
-                                    React.createElement("span", { className: "wf-note" }, "(govt DB \u2014 fully exempt)")),
+                                    "Pension ",
+                                    React.createElement("span", { className: "wf-note" }, "(govt DB \u2014 fully exempt in AL)")),
                                 React.createElement("span", { className: "wf-value zero" }, "\u2014 exempt")),
                             React.createElement("div", { className: "wf-row" },
                                 React.createElement("span", { className: "wf-label" }, "Dividends / Cap Gains / Interest"),
@@ -1040,7 +1224,7 @@ function RothPlanner() {
                             React.createElement("div", { className: "wf-row" },
                                 React.createElement("span", { className: "wf-label" },
                                     "Taxable RMD (after QCD) ",
-                                    React.createElement("span", { className: "wf-note" }, "(\u2212$6k age-65 exclusion)")),
+                                    React.createElement("span", { className: "wf-note" }, results.is65Plus ? "(\u2212$6k age-65 exclusion)" : "(no exclusion — under 65)")),
                                 React.createElement("span", { className: "wf-value" }, fmt(Math.max(0, results.taxableRMD - results.alRMDExclusion)))),
                             inputs.roth > 0 && React.createElement("div", { className: "wf-row roth-row" },
                                 React.createElement("span", { className: "wf-label" }, "Roth Conversion"),
@@ -1057,10 +1241,10 @@ function RothPlanner() {
                                     "\u2212 ",
                                     fmt(results.alStdDed))),
                             React.createElement("div", { className: "wf-row" },
-                                React.createElement("span", { className: "wf-label" }, "Personal Exemption"),
+                                React.createElement("span", { className: "wf-label" }, `Personal Exemption (${results.isMFJ ? "MFJ" : "Single"})`),
                                 React.createElement("span", { className: "wf-value deduct" },
                                     "\u2212 ",
-                                    fmt(1500))),
+                                    fmt(results.alPersonalExemption))),
                             React.createElement("div", { className: "wf-row" },
                                 React.createElement("span", { className: "wf-label" }, "Federal Taxes Paid (AL deduction)"),
                                 React.createElement("span", { className: "wf-value deduct" },
@@ -1113,7 +1297,7 @@ function RothPlanner() {
                                     React.createElement("div", { className: "stat-value" }, fmt(results.recommendedQuarterly)),
                                     React.createElement("div", { className: "stat-sub" },
                                         results.priorTotalTax > 0
-                                            ? (results.agi > 150000 ? "Lesser of 90% current or 110% prior year" : "Lesser of 90% current or 100% prior year")
+                                            ? (results.agi > 150000 ? "Lesser of 90% current or 110% prior year (AGI > $150k)" : "Lesser of 90% current or 100% prior year")
                                             : "90% of current year ÷ 4"))),
 
                             /* ── Four Quarter Payment Cards ── */
@@ -1168,7 +1352,7 @@ function RothPlanner() {
                                 results.priorTotalTax > 0
                                     ? React.createElement("div", { className: "wf-row" },
                                         React.createElement("span", { className: "wf-label" },
-                                            results.agi > 150000 ? "110% Prior Year (safe harbor option B)" : "100% Prior Year (safe harbor option B)"),
+                                            results.agi > 150000 ? "\u00D7 110% Prior Year safe harbor (AGI > $150k)" : "\u00D7 100% Prior Year safe harbor"),
                                         React.createElement("span", { className: "wf-value" }, fmt(results.safeHarborAnnual)))
                                     : React.createElement("div", { className: "wf-row" },
                                         React.createElement("span", { className: "wf-label" }, "Prior Year Method — enter prior year tax above to unlock"),
@@ -1180,7 +1364,7 @@ function RothPlanner() {
                                     React.createElement("span", { className: "wf-label" }, "\u00F7 4 = Each Quarterly Payment"),
                                     React.createElement("span", { className: "wf-value" }, fmt(results.recommendedQuarterly))))))),
 
-            React.createElement("p", { className: "footnote" }, "Federal: Rev. Proc. 2025-32 \u00B7 $16,100 std ded + $2,050 over-65 + up to $6,000 OBBB senior ded \u00B7 QBI (\u00A7199A): 20% deduction on K-1 income, phases out $197,300\u2013$272,300 (single, 2026 OBBB thresholds) \u00B7 Alabama: SS exempt \u00B7 Pension exempt \u00B7 $6,000 age-65 RMD exclusion \u00B7 Federal taxes deductible \u00B7 K-1 income taxable in AL (no state QBI deduction) \u00B7 Estimated tax: safe harbor = 90% current year OR 100%/110% prior year \u00B7 Q due dates: Apr 15, Jun 16, Sep 15, Jan 15 \u00B7 Not tax advice \u2014 consult a CPA."))));
+            React.createElement("p", { className: "footnote" }, "Federal 2026 (Rev. Proc. 2025-32): Single std ded $16,100 / MFJ $32,200 \u00B7 Over-65 extra $2,050 (single) / $1,650 (MFJ per spouse) \u00B7 OBBB senior ded up to $6,000, phases out above $75k (single) / $150k (MFJ) \u00B7 QBI (\u00A7199A): 20% of K-1 income, single phases $197,300\u2013$272,300 / MFJ $394,600\u2013$544,600 \u00B7 Alabama: SS & govt pension exempt \u00B7 $6,000 age-65 RMD exclusion \u00B7 Federal taxes deductible in AL \u00B7 AL MFJ brackets: 2%/$1k / 4%/$6k / 5%+ \u00B7 Safe harbor: 90% current or 100%/110% prior year \u00B7 Not tax advice \u2014 consult a CPA."))));
 }
 ReactDOM.render(React.createElement(RothPlanner), document.getElementById('root'));
 
